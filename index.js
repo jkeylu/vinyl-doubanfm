@@ -43,7 +43,7 @@ function ReadStream(doubanFM) {
 
   var options = {
     objectMode: true,
-    highWaterMark: 1
+    highWaterMark: 0
   };
 
   Stream.Readable.call(this, options);
@@ -51,28 +51,12 @@ function ReadStream(doubanFM) {
 
 ReadStream.prototype._read = function(n) {
   var self = this;
-  var rs = this._readableState;
-  console.log('highWaterMark: ', rs.highWaterMark);
-  if (rs.length >= rs.highWaterMark) {
-    return;
-  }
-  this.doubanFM.new(function(err, songs) {
-    if (err) {
-      self.emit('error', err);
-      return;
-    }
-    console.log(songs.length);
-    var song, file;
-    for (var i = 0; i < songs.length; i++) {
-      song = songs[i];
-      file = new File({
-        path: song.url
-      });
-      defaults(file, song);
-      self.push(file);
-    }
-    console.log('readable state buffer len: ', self._readableState.buffer.length);
-    console.log('readable State length: ', self._readableState.length);
+  this.doubanFM.next(function(err, song) {
+    var file = new File({
+      path: song.url
+    });
+    defaults(file, song);
+    self.push(file);
   });
 };
 
@@ -80,37 +64,33 @@ util.inherits(SimpleFileTransform, Stream.Transform);
 function SimpleFileTransform() {
   var options = {
     objectMode: true,
-    highWaterMark: 1
+    highWaterMark: 0
   }
 
   Stream.Transform.call(this, options);
 }
 
 SimpleFileTransform.prototype._transform = function(file, encoding, callback) {
-  var self = this;
-  console.log('file transform');
-  http.get(file.path, function(res) {
-    file.contents = res;
-    console.log('transform before callback');
-    try {
-    callback(null, file);
-    } catch(e) {
-      console.log(e);
-    }
-    var rs = self._readableState
-      , ws = self._writableState;
-    //console.log()
-  });
+  var pipe = file.pipe;
+  file.pipe = function(stream, opt) {
+    http.get(file.path, function(res) {
+      file.contents = res;
+      pipe.call(file, stream, opt);
+    });
+    return stream;
+  };
+  callback(null, file);
 };
 
 var DOUBAMFM_API_DOMAIN = 'http://www.douban.com';
+var DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.65 Safari/537.36';
 function generateRequestOptions(api, obj) {
   obj = extend({ app_name: 'radio_desktop_win', version: 100 }, obj);
   var query = qs.stringify(obj)
     , url = util.format('%s/j/app/radio/%s?%s', DOUBAMFM_API_DOMAIN, api, query)
     , options = urlParse(url);
   options.headers = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.65 Safari/537.36'
+    'User-Agent': DEFAULT_USER_AGENT
   };
   return options;
 }
@@ -166,29 +146,63 @@ function postData(options, data, callback) {
 function DoubanFM() {
   this.user = null;
   this.channelId = 0;
+  this.songs = [];
+  this.currentSid = null;
 }
 
-DoubanFM.prototype.login = function(callback) {
+DoubanFM.prototype.next = function(callback) {
+  var self = this;
+  if (this.songs.length > 0) {
+    var song = this.songs.pop();
+    callback(null, song);
+    if (this.songs.length == 0) {
+      this.playing(this.currentSid, function(err, songs) {
+        self.songs = songs;
+      });
+    }
+    return;
+  }
+
+  this.new(function(err, songs) {
+    if (err) {
+      self.next(callback);
+      return;
+    }
+    self.songs = songs;
+    self.next(callback);
+  });
+};
+
+DoubanFM.prototype.login = function(email, password, callback) {
+  var options = urlParse(DOUBAMFM_API_DOMAIN + '/j/app/login');
+  options.headers = {
+    'User-Agent': DEFAULT_USER_AGENT
+  };
+  var data = {
+    app_name: 'radio_desktop_win',
+    version: 100,
+    email: email,
+    password: password
+  };
+  postData(options, data, callback);
 };
 
 DoubanFM.prototype.getChannels = function(callback) {
+  var options = generateRequestOptions('channels');
+  getJson(options, function(err, res, jsonData) {
+    if (err) {
+      return callback(err);
+    }
+    callback(null, jsonData.channels);
+  });
 };
 
-DoubanFM.prototype.bye = function(callback) {
-};
-
-DoubanFM.prototype.end = function(callback) {
-};
-
-DoubanFM.prototype.new = function(callback) {
-  var obj = {
-    type: 'n'
-  };
-  obj.channel = this.channelId;
-  if (this.user) {
-    obj.user_id = this.user.user_id;
-    obj.expire = this.user.expire;
-    obj.token = this.user.token;
+function requestSongs(doubanFM, obj, callback) {
+  obj.channel = doubanFM.channelId;
+  if (doubanFM.user) {
+    obj.user_id = doubanFM.user.user_id;
+    obj.expire = doubanFM.user.expire;
+    obj.token = doubanFM.user.token;
   }
   var options = generateRequestOptions('people', obj);
   getJson(options, function(err, res, jsonData) {
@@ -203,35 +217,62 @@ DoubanFM.prototype.new = function(callback) {
     }
     callback(null, jsonData.song);
   });
-};
+}
 
-DoubanFM.prototype.playing = function(callback) {
+
+DoubanFM.prototype.bye = function(sid, callback) {
   var obj = {
-    type: 'p'
+    type: 'b',
+    sid: sid
   };
-  obj.channel = this.channelId;
-  var options = generateRequestOptions('people', obj);
-  getJson(options, function(err, res, jsonData) {
-    if (err) {
-      return callback(err);
-    }
-    if (!jsonData) {
-      return callback(new Error(res.statusCode));
-    }
-    if (jsonData.r != 0) {
-      return callback(new Error(jsonData.err));
-    }
-    callback(null, jsonData.song);
-  });
+  requestSongs(this, obj, callback);
 };
 
-DoubanFM.prototype.skip = function(callback) {
+DoubanFM.prototype.end = function(sid, callback) {
+  var obj = {
+    type: 'e',
+    sid: sid
+  };
 };
 
-DoubanFM.prototype.rate = function(callback) {
+DoubanFM.prototype.new = function(callback) {
+  var obj = {
+    type: 'n'
+  };
+  requestSongs(this, obj, callback);
 };
 
-DoubanFM.prototype.unrate = function(callback) {
+DoubanFM.prototype.playing = function(sid, callback) {
+  var obj = {
+    type: 'p',
+    sid: sid
+  };
+  requestSongs(this, obj, callback);
+};
+
+
+DoubanFM.prototype.skip = function(sid, callback) {
+  var obj = {
+    type: 's',
+    sid: sid
+  };
+  requestSongs(this, obj, callback);
+};
+
+DoubanFM.prototype.rate = function(sid, callback) {
+  var obj = {
+    type: 'r',
+    sid: sid
+  };
+  requestSongs(this, obj, callback);
+};
+
+DoubanFM.prototype.unrate = function(sid, callback) {
+  var obj = {
+    type: 'u',
+    sid: sid
+  };
+  requestSongs(this, obj, callback);
 };
 
 DoubanFM.prototype.createReadStream = function() {
